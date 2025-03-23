@@ -52,6 +52,7 @@ import {
   InstrumentationNodeModuleDefinition,
   safeExecuteInTheMiddle,
   isWrapped,
+  InstrumentationNodeModuleFile,
 } from '@opentelemetry/instrumentation';
 
 export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumentationConfig> {
@@ -60,36 +61,91 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
   }
 
   protected init() {
-    const unpatch = (moduleExports: typeof kafkaJs) => {
-      if (isWrapped(moduleExports?.Kafka?.prototype.producer)) {
-        this._unwrap(moduleExports.Kafka.prototype, 'producer');
+    const instrumentation = this;
+    const unpatch = (moduleExports: any) => {
+      if (isWrapped(moduleExports.send)) {
+        this._unwrap(moduleExports, 'send');
       }
-      if (isWrapped(moduleExports?.Kafka?.prototype.consumer)) {
-        this._unwrap(moduleExports.Kafka.prototype, 'consumer');
+      if (isWrapped(moduleExports.sendBatch)) {
+        this._unwrap(moduleExports, 'sendBatch');
       }
     };
+    
 
-    const module = new InstrumentationNodeModuleDefinition(
-      'kafkajs',
+    const producerFileInstrumentation = new InstrumentationNodeModuleFile(
+      "kafkajs/src/producer/messageProducer.ts",
       ['>=0.3.0 <3'],
-      (moduleExports: typeof kafkaJs) => {
+      (moduleExports) => {
         unpatch(moduleExports);
-        this._wrap(
-          moduleExports?.Kafka?.prototype,
-          'producer',
-          this._getProducerPatch()
-        );
-        this._wrap(
-          moduleExports?.Kafka?.prototype,
-          'consumer',
-          this._getConsumerPatch()
-        );
+    
+        if (typeof moduleExports !== "function") {
+          return moduleExports;
+        }
 
-        return moduleExports;
+        return function (this: any) {
+          const producerInstance = moduleExports.apply(this, arguments);
+
+          instrumentation._wrap(
+            producerInstance,
+            "send",
+            instrumentation._getProducerSendPatch()
+          );
+          instrumentation._wrap(
+            producerInstance,
+            "sendBatch",
+            instrumentation._getProducerSendBatchPatch()
+          );
+
+          return producerInstance;
+        };
       },
       unpatch
     );
+    
+    const module = new InstrumentationNodeModuleDefinition(
+      "kafkajs",
+      [">=0.3.0 <3"],
+      undefined, // only patch internal files, not the main module
+      undefined, // only patch internal files, not the main module
+      [
+        producerFileInstrumentation,
+        consumerFileInstrumentation
+      ]
+    );
     return module;
+  }
+  
+  private _getProducerPatch() {
+    const instrumentation = this;
+    // todo: more strict type?
+    return (original: any) => {
+      return function producer(
+        this: any,
+        ...args: Parameters<typeof original>
+      ) {
+        const newProducer: Producer = original.apply(this, args);
+
+        if (isWrapped(newProducer.sendBatch)) {
+          instrumentation._unwrap(newProducer, 'sendBatch');
+        }
+        instrumentation._wrap(
+          newProducer,
+          'sendBatch',
+          instrumentation._getProducerSendBatchPatch()
+        );
+
+        if (isWrapped(newProducer.send)) {
+          instrumentation._unwrap(newProducer, 'send');
+        }
+        instrumentation._wrap(
+          newProducer,
+          'send',
+          instrumentation._getProducerSendPatch()
+        );
+
+        return newProducer;
+      };
+    };
   }
 
   private _getConsumerPatch() {
@@ -116,37 +172,6 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
     };
   }
 
-  private _getProducerPatch() {
-    const instrumentation = this;
-    return (original: kafkaJs.Kafka['producer']) => {
-      return function consumer(
-        this: kafkaJs.Kafka,
-        ...args: Parameters<kafkaJs.Kafka['producer']>
-      ) {
-        const newProducer: Producer = original.apply(this, args);
-
-        if (isWrapped(newProducer.sendBatch)) {
-          instrumentation._unwrap(newProducer, 'sendBatch');
-        }
-        instrumentation._wrap(
-          newProducer,
-          'sendBatch',
-          instrumentation._getProducerSendBatchPatch()
-        );
-
-        if (isWrapped(newProducer.send)) {
-          instrumentation._unwrap(newProducer, 'send');
-        }
-        instrumentation._wrap(
-          newProducer,
-          'send',
-          instrumentation._getProducerSendPatch()
-        );
-
-        return newProducer;
-      };
-    };
-  }
 
   private _getConsumerRunPatch() {
     const instrumentation = this;
