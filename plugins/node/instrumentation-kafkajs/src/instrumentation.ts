@@ -99,7 +99,9 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
           return producerInstance;
         };
       },
-      unpatch
+      () => {
+        this.unpatched = true;
+      }
     );
     
     const module = new InstrumentationNodeModuleDefinition(
