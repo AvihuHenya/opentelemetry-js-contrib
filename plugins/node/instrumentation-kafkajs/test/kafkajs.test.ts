@@ -202,6 +202,70 @@ describe('instrumentation-kafkajs', () => {
       );
     };
 
+    describe('broker produce patch', () => {
+      beforeEach(() => {
+        messagesSent = [];
+      });
+    
+      it('should create spans from broker-level produce patch', async () => {
+        const fakeBroker = {
+          brokerAddress: 'broker1:9092',
+          produce: function (_args: any) {
+            return Promise.resolve();
+          },
+        };
+    
+        const produceArgs = {
+          topicData: [
+            {
+              topic: 'test-topic',
+              partitions: [
+                {
+                  partition: 0,
+                  messages: [
+                    {
+                      key: Buffer.from('key1'),
+                      value: Buffer.from('value1'),
+                      timestamp: Date.now().toString(),
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+    
+        const patch = (instrumentation as any).getBrokerProducePatch();
+        const wrappedProduce = patch(fakeBroker.produce);
+        fakeBroker.produce = wrappedProduce;
+    
+        await fakeBroker.produce.call(fakeBroker, produceArgs);
+    
+        const spans = getTestSpans();
+        assert.strictEqual(spans.length, 1);
+        const span = spans[0];
+    
+        assert.strictEqual(span.name, 'test-topic');
+        assert.strictEqual(span.kind, SpanKind.PRODUCER);
+        assert.strictEqual(
+          span.attributes[ATTR_MESSAGING_SYSTEM],
+          MESSAGING_SYSTEM_VALUE_KAFKA
+        );
+        assert.strictEqual(
+          span.attributes[ATTR_MESSAGING_DESTINATION_NAME],
+          'test-topic'
+        );
+        assert.strictEqual(
+          span.attributes[ATTR_MESSAGING_DESTINATION_PARTITION_ID],
+          0
+        );
+        assert.strictEqual(
+          span.attributes[ATTR_SERVER_ADDRESS],
+          'broker1:9092'
+        );
+      });
+    });
+
     describe('successful send', () => {
       const defaultRecordMetadata = [
         {
