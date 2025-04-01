@@ -31,6 +31,7 @@ import {
 import {
   InstrumentationBase,
   InstrumentationNodeModuleDefinition,
+  InstrumentationNodeModuleFile,
   isWrapped,
   safeExecuteInTheMiddle,
 } from '@opentelemetry/instrumentation';
@@ -51,7 +52,7 @@ import type {
   Producer,
   RecordMetadata,
 } from 'kafkajs';
-import { EVENT_LISTENERS_SET } from './internal-types';
+import { EVENT_LISTENERS_SET, TopicData } from './internal-types';
 import { bufferTextMapGetter } from './propagator';
 import {
   ATTR_MESSAGING_BATCH_MESSAGE_COUNT,
@@ -133,6 +134,15 @@ interface MessageProcessDurationAttributes
 }
 type RecordPendingMetric = (errorType?: string | undefined) => void;
 
+// for example: broker info, consumer group info.
+const ConsumeMessageExtraAttributes = Symbol(
+  "opentelemetry.instrumentation_kafkajs.consume_message_extra_attributes"
+);
+
+export type PatchedKafkaMessage = KafkaMessage & {
+  [ConsumeMessageExtraAttributes]: Attributes;
+};
+
 function prepareCounter<T extends Attributes>(
   meter: Counter<T>,
   value: number,
@@ -189,37 +199,106 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
     );
   }
 
-  protected init() {
-    const unpatch = (moduleExports: typeof kafkaJs) => {
-      if (isWrapped(moduleExports?.Kafka?.prototype.producer)) {
-        this._unwrap(moduleExports.Kafka.prototype, 'producer');
+  protected init() { 
+    const instrumentation = this;
+
+    const unpatchBrokerMethod = (moduleExports: any) => { 
+      if (moduleExports?.prototype?.produce?.__wrapped) {
+        instrumentation._unwrap(moduleExports.prototype, "produce");
       }
+    };
+
+    const unpatchKafkaModule = (moduleExports: typeof kafkaJs) => {
       if (isWrapped(moduleExports?.Kafka?.prototype.consumer)) {
         this._unwrap(moduleExports.Kafka.prototype, 'consumer');
       }
     };
 
+    const brokerFileInstrumentation = new InstrumentationNodeModuleFile(
+      "kafkajs/src/broker/index.js",
+      [">=0.3.0 <3"],
+      (moduleExports: any) => {
+        this._wrap(
+          moduleExports.prototype,
+          "produce",
+          this.getBrokerProducePatch()
+        );
+        return moduleExports;
+      },
+      unpatchBrokerMethod
+    );
+
     const module = new InstrumentationNodeModuleDefinition(
       'kafkajs',
       ['>=0.3.0 <3'],
       (moduleExports: typeof kafkaJs) => {
-        unpatch(moduleExports);
-        this._wrap(
-          moduleExports?.Kafka?.prototype,
-          'producer',
-          this._getProducerPatch()
-        );
         this._wrap(
           moduleExports?.Kafka?.prototype,
           'consumer',
           this._getConsumerPatch()
         );
-
         return moduleExports;
       },
-      unpatch
+      unpatchKafkaModule,
+      [
+        brokerFileInstrumentation
+      ]
     );
     return module;
+  }
+
+  private getBrokerProducePatch() {
+    const instrumentation = this;
+    return (original: any) => {
+      return function produce(this: any, produceArgs: any) {
+        // The broker object is the caller, and JavaScript binds this in that function call to the broker instance.
+        const brokerAddress: string = this.brokerAddress;
+        const topicData: TopicData = produceArgs.topicData;
+        
+        const spans = topicData.flatMap((t) => {
+          const topic = t.topic;
+          return t.partitions.flatMap((p) => {
+            const partition = p.partition; 
+            return p.messages.map((m: Message) => {
+              const singleMessageSpan = instrumentation.tracer.startSpan(
+                topic,
+                {
+                  kind: SpanKind.PRODUCER,
+                  startTime: Number(m.timestamp), 
+                  attributes: {
+                    [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
+                    [ATTR_MESSAGING_OPERATION_NAME]: "produce",
+                    [ATTR_MESSAGING_DESTINATION_NAME]: topic,
+                    [ATTR_MESSAGING_DESTINATION_PARTITION_ID]: partition,
+                    [ATTR_MESSAGING_KAFKA_MESSAGE_KEY]:
+                      m.key?.toString("base64"),
+                    [ATTR_SERVER_ADDRESS]: brokerAddress,
+                  },
+                }
+              );
+              // active span?
+              // record the span context in each message headers for context propagation to downstream spans
+              m.headers = m.headers ?? {}; // NOTICE - changed via side effect
+              propagation.inject(
+                trace.setSpan(context.active(), singleMessageSpan),
+                m.headers
+              );
+
+              m.headers = { ...m.headers };
+              return singleMessageSpan;
+            });
+          });
+        });
+
+        try {
+          return original.apply(this, arguments);
+        } finally {
+          spans.forEach((span) => {
+            span.end();
+          });
+        }
+      };
+    };
   }
 
   private _getConsumerPatch() {
@@ -269,40 +348,6 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
       [ATTR_SERVER_ADDRESS]: address,
       [ATTR_SERVER_PORT]: Number.parseInt(port, 10),
     });
-  }
-
-  private _getProducerPatch() {
-    const instrumentation = this;
-    return (original: kafkaJs.Kafka['producer']) => {
-      return function consumer(
-        this: kafkaJs.Kafka,
-        ...args: Parameters<kafkaJs.Kafka['producer']>
-      ) {
-        const newProducer: Producer = original.apply(this, args);
-
-        if (isWrapped(newProducer.sendBatch)) {
-          instrumentation._unwrap(newProducer, 'sendBatch');
-        }
-        instrumentation._wrap(
-          newProducer,
-          'sendBatch',
-          instrumentation._getProducerSendBatchPatch()
-        );
-
-        if (isWrapped(newProducer.send)) {
-          instrumentation._unwrap(newProducer, 'send');
-        }
-        instrumentation._wrap(
-          newProducer,
-          'send',
-          instrumentation._getProducerSendPatch()
-        );
-
-        instrumentation._setKafkaEventListeners(newProducer);
-
-        return newProducer;
-      };
-    };
   }
 
   private _getConsumerRunPatch() {
@@ -500,92 +545,6 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
     };
   }
 
-  private _getProducerSendBatchPatch() {
-    const instrumentation = this;
-    return (original: Producer['sendBatch']) => {
-      return function sendBatch(
-        this: Producer,
-        ...args: Parameters<Producer['sendBatch']>
-      ): ReturnType<Producer['sendBatch']> {
-        const batch = args[0];
-        const messages = batch.topicMessages || [];
-
-        const spans: Span[] = [];
-        const pendingMetrics: RecordPendingMetric[] = [];
-
-        messages.forEach(topicMessage => {
-          topicMessage.messages.forEach(message => {
-            spans.push(
-              instrumentation._startProducerSpan(topicMessage.topic, message)
-            );
-            pendingMetrics.push(
-              prepareCounter(instrumentation._sentMessages, 1, {
-                [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
-                [ATTR_MESSAGING_OPERATION_NAME]: 'send',
-                [ATTR_MESSAGING_DESTINATION_NAME]: topicMessage.topic,
-                ...(message.partition !== undefined
-                  ? {
-                      [ATTR_MESSAGING_DESTINATION_PARTITION_ID]: String(
-                        message.partition
-                      ),
-                    }
-                  : {}),
-              })
-            );
-          });
-        });
-        const origSendResult: Promise<RecordMetadata[]> = original.apply(
-          this,
-          args
-        );
-        return instrumentation._endSpansOnPromise(
-          spans,
-          pendingMetrics,
-          origSendResult
-        );
-      };
-    };
-  }
-
-  private _getProducerSendPatch() {
-    const instrumentation = this;
-    return (original: Producer['send']) => {
-      return function send(
-        this: Producer,
-        ...args: Parameters<Producer['send']>
-      ): ReturnType<Producer['send']> {
-        const record = args[0];
-        const spans: Span[] = record.messages.map(message => {
-          return instrumentation._startProducerSpan(record.topic, message);
-        });
-
-        const pendingMetrics: RecordPendingMetric[] = record.messages.map(m =>
-          prepareCounter(instrumentation._sentMessages, 1, {
-            [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
-            [ATTR_MESSAGING_OPERATION_NAME]: 'send',
-            [ATTR_MESSAGING_DESTINATION_NAME]: record.topic,
-            ...(m.partition !== undefined
-              ? {
-                  [ATTR_MESSAGING_DESTINATION_PARTITION_ID]: String(
-                    m.partition
-                  ),
-                }
-              : {}),
-          })
-        );
-        const origSendResult: Promise<RecordMetadata[]> = original.apply(
-          this,
-          args
-        );
-        return instrumentation._endSpansOnPromise(
-          spans,
-          pendingMetrics,
-          origSendResult
-        );
-      };
-    };
-  }
-
   private _endSpansOnPromise<T>(
     spans: Span[],
     pendingMetrics: RecordPendingMetric[],
@@ -677,40 +636,4 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
     return span;
   }
 
-  private _startProducerSpan(topic: string, message: Message) {
-    const span = this.tracer.startSpan(`send ${topic}`, {
-      kind: SpanKind.PRODUCER,
-      attributes: {
-        [ATTR_MESSAGING_SYSTEM]: MESSAGING_SYSTEM_VALUE_KAFKA,
-        [ATTR_MESSAGING_DESTINATION_NAME]: topic,
-        [ATTR_MESSAGING_KAFKA_MESSAGE_KEY]: message.key
-          ? String(message.key)
-          : undefined,
-        [ATTR_MESSAGING_KAFKA_MESSAGE_TOMBSTONE]:
-          message.key && message.value === null ? true : undefined,
-        [ATTR_MESSAGING_DESTINATION_PARTITION_ID]:
-          message.partition !== undefined
-            ? String(message.partition)
-            : undefined,
-        [ATTR_MESSAGING_OPERATION_NAME]: 'send',
-        [ATTR_MESSAGING_OPERATION_TYPE]: MESSAGING_OPERATION_TYPE_VALUE_SEND,
-      },
-    });
-
-    message.headers = message.headers ?? {};
-    propagation.inject(trace.setSpan(context.active(), span), message.headers);
-
-    const { producerHook } = this.getConfig();
-    if (producerHook) {
-      safeExecuteInTheMiddle(
-        () => producerHook(span, { topic, message }),
-        e => {
-          if (e) this._diag.error('producerHook error', e);
-        },
-        true
-      );
-    }
-
-    return span;
-  }
 }

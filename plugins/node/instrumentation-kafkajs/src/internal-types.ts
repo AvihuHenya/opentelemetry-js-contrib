@@ -20,6 +20,17 @@ export const EVENT_LISTENERS_SET = Symbol(
   'opentelemetry.instrumentation.kafkajs.eventListenersSet'
 );
 
+export interface Partition {
+  partition: number;
+  firstSequence: number;
+  messages: Array<any>;
+}
+
+export interface Topic {
+  topic: string;
+  partitions: Array<Partition>;
+}
+
 export interface ConsumerExtended extends KafkaJSTypes.Consumer {
   [EVENT_LISTENERS_SET]?: boolean; // flag to identify if the event listeners for instrumentation have been set
 }
@@ -27,3 +38,5 @@ export interface ConsumerExtended extends KafkaJSTypes.Consumer {
 export interface ProducerExtended extends KafkaJSTypes.Producer {
   [EVENT_LISTENERS_SET]?: boolean; // flag to identify if the event listeners for instrumentation have been set
 }
+
+export type TopicData = Array<Topic>;
