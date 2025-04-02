@@ -45,10 +45,11 @@ const dockerRunCmds = {
   postgres:
     'docker run --rm -d --name otel-postgres -p 54320:5432 -e POSTGRES_PASSWORD=postgres postgres:16-alpine',
   redis: 'docker run --rm -d --name otel-redis -p 63790:6379 redis:alpine',
+  kafka: 'docker run -d --name kafka -p 9092:9092 -e KAFKA_CFG_NODE_ID=0 -e KAFKA_CFG_PROCESS_ROLES=broker,controller -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@localhost:9093 -e KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT -e KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true -e ALLOW_PLAINTEXT_LISTENER=yes bitnami/kafka:latest',
 };
 
-export function startDocker(db: keyof typeof dockerRunCmds) {
-  const tasks = [run(dockerRunCmds[db])];
+export function startDocker(service: keyof typeof dockerRunCmds) {
+  const tasks = [run(dockerRunCmds[service])];
 
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i];
@@ -61,8 +62,8 @@ export function startDocker(db: keyof typeof dockerRunCmds) {
   return true;
 }
 
-export function cleanUpDocker(db: keyof typeof dockerRunCmds) {
-  run(`docker stop otel-${db}`);
+export function cleanUpDocker(service: keyof typeof dockerRunCmds) {
+  run(`docker stop otel-${service}`);
 }
 
 function run(cmd: string) {
